@@ -1,0 +1,9 @@
+{
+  "name": "REPOBlacklist",
+  "version_number": "0.2.2",
+  "website_url": "https://github.com/IsaiahAnson/REPOBlacklist",
+  "description": "BepInEx plugin for R.E.P.O. Host-side blacklist for shop items, level valuables, and enemies via an in-game F3 menu. Strips blacklisted assets from runtime List/Array/Dictionary spawn pools at scene load. Persists globally via JSON file.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100"
+  ]
+}
