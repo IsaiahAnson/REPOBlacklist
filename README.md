@@ -1,5 +1,9 @@
 # REPOBlacklist
 
+[**Get it on Thunderstore**](https://thunderstore.io/c/repo/p/Mentalize/REPOBlacklist/)
+
+<img src="icon.png" width="120" align="right" alt="REPOBlacklist icon">
+
 A BepInEx plugin for R.E.P.O. that lets the host pick which shop items, level valuables, and enemies should never spawn. Selections are made through an in-game IMGUI menu (default hotkey **F3**) and persist across every save file on the install.
 
 Only the player hosting the lobby's blacklist takes effect — shop, level valuable, and enemy selection all run host-side in REPO and replicate to clients via Photon. Non-hosts can still install the mod and use the menu; their toggles save locally and become active the next time they host.
