@@ -100,3 +100,9 @@ To run locally: drop the DLL into `<BepInEx profile>/BepInEx/plugins/REPOBlackli
 
 ### 0.1.0
 - Initial implementation: F3 IMGUI menu, JSON blacklist file, scene-load filter pass over `List<T>` and `T[]` fields on scene `MonoBehaviour`s for `Item` / `ValuableObject` / `EnemySetup` element types.
+
+## License
+
+Copyright (c) 2026 Isaiah Anson. All rights reserved. You may use the released software for
+personal, non-commercial use; copying, modifying or redistributing it requires written
+permission. See [LICENSE](LICENSE).
