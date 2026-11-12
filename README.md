@@ -1,8 +1,6 @@
-# REPOBlacklist
+<img src="https://raw.githubusercontent.com/IsaiahAnson/REPOBlacklist/main/assets/banner.svg" width="100%" alt="REPOBlacklist, a R.E.P.O. mod by Mentalize. Pick what never spawns when you host. Host-side, in-game F3 menu, BepInEx 5.">
 
-[**Get it on Thunderstore**](https://thunderstore.io/c/repo/p/Mentalize/REPOBlacklist/)
-
-<img src="icon.png" width="120" align="right" alt="REPOBlacklist icon">
+<a href="https://thunderstore.io/c/repo/p/Mentalize/REPOBlacklist/"><img src="https://raw.githubusercontent.com/IsaiahAnson/REPOBlacklist/stats/downloads.svg" width="100%" alt="Download count and latest version on Thunderstore. Get it on Thunderstore."></a>
 
 A BepInEx plugin for R.E.P.O. that lets the host pick which shop items, level valuables, and enemies should never spawn. Selections are made through an in-game IMGUI menu (default hotkey **F3**) and persist across every save file on the install.
 
