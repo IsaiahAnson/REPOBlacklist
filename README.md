@@ -126,7 +126,7 @@ To run locally: drop the DLL into `<BepInEx profile>/BepInEx/plugins/REPOBlackli
 - The menu holds the game's controls the way the game's own menus do, and Esc closes it. The patches on Unity's input methods are gone.
 - The blacklist file is saved safely, and a file that cannot be read is kept as a `.bak` copy.
 
-Every version is in [CHANGELOG.md](CHANGELOG.md).
+Every version is in [CHANGELOG.md](https://github.com/IsaiahAnson/REPOBlacklist/blob/main/CHANGELOG.md).
 
 <!-- github-only:start -->
 ## License
