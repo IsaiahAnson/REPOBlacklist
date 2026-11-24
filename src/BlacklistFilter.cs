@@ -3,347 +3,469 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using HarmonyLib;
 using UnityEngine;
 
 namespace REPOBlacklist
 {
     /// <summary>
-    /// Discovers REPO's asset types (Item / ValuableObject / EnemySetup) by name from
-    /// loaded assemblies, then strips blacklisted entries out of any List/array/Dictionary
-    /// fields we can find — both on scene MonoBehaviours (including DDOL/inactive) and
-    /// on static fields of game-assembly types. Type-resolution is cached.
-    ///
-    /// Type-name lookup is intentionally lenient: REPO has historically renamed these
-    /// classes between updates. We try a list of candidates and use the first match.
+    /// Keeps blacklisted things out of what the host rolls. Each hook sits on the one game method
+    /// that builds or reads a pool, and only acts for the host (or in singleplayer):
+    ///   shop items     - after ShopManager.GetAllItemsFromStatsManager fills the shop pools
+    ///   upgrade stand  - after UpgradeStand.GetWeightedUpgradeExcluding picks a rerolled upgrade
+    ///   enemies        - around EnemyDirector.PickEnemies, with the count fixed in AmountSetup
+    ///   valuables      - around the first step of ValuableDirector.SetupHost
+    /// The game's own asset lists (StatsManager.itemDictionary, the enemy difficulty lists and the
+    /// level valuable presets) are left as the game made them, so saves, owned items and other
+    /// mods still see the full game.
     /// </summary>
-    public static class BlacklistFilter
+    internal static class BlacklistFilter
     {
-        private static readonly string[] ItemTypeCandidates = { "Item" };
-        private static readonly string[] ValuableTypeCandidates = { "ValuableObject", "Valuable" };
-        private static readonly string[] EnemyTypeCandidates = { "EnemySetup", "EnemiesSetup", "EnemyParent" };
+        private static readonly List<string> ActiveHooks = new List<string>();
+        private static readonly List<string> FailedHooks = new List<string>();
+        private static readonly HashSet<string> ReportedFailures = new HashSet<string>();
 
-        private static Type _itemType;
-        private static Type _valuableType;
-        private static Type _enemyType;
-        private static bool _resolved;
+        private static MethodInfo _upgradeRoll;
+        private static bool _rerollingUpgrade;
 
-        /// <summary>Cached static-field hits — built once, applied each tick.</summary>
-        private static List<FieldHit> _staticFieldCache;
+        // Counted over one EnemyDirector.AmountSetup call, for one log line per level.
+        private static int _enemyPicksFiltered;
 
-        /// <summary>Per-Type instance-field match cache — built lazily on first sight.
-        /// Reflection over fields is the hot path on big scenes; this turns
-        /// "GetFields() then filter" into a one-shot lookup.</summary>
-        private static readonly Dictionary<Type, FieldHit[]> _instanceFieldCache = new Dictionary<Type, FieldHit[]>();
-        private static readonly FieldHit[] _emptyHits = Array.Empty<FieldHit>();
-
-        private struct FieldHit
+        /// <summary>One line for the log and the menu: which hooks are on.</summary>
+        public static string HookSummary
         {
-            public FieldInfo Field;
-            public BlacklistCategory Cat;
-            public Type Elem;
-            public ContainerKind Kind;
-        }
-
-        public static Type ItemType { get { Resolve(); return _itemType; } }
-        public static Type ValuableType { get { Resolve(); return _valuableType; } }
-        public static Type EnemyType { get { Resolve(); return _enemyType; } }
-
-        public static Type TypeFor(BlacklistCategory cat)
-        {
-            switch (cat)
+            get
             {
-                case BlacklistCategory.Item: return ItemType;
-                case BlacklistCategory.Valuable: return ValuableType;
-                case BlacklistCategory.Enemy: return EnemyType;
-                default: return null;
+                string text = ActiveHooks.Count > 0 ? string.Join(", ", ActiveHooks) : "none";
+                if (FailedHooks.Count > 0) text += " (not available in this game version: " + string.Join(", ", FailedHooks) + ")";
+                return text;
             }
         }
 
-        private static void Resolve()
-        {
-            if (_resolved) return;
-            _resolved = true;
-            _itemType = ResolveOne(ItemTypeCandidates);
-            _valuableType = ResolveOne(ValuableTypeCandidates);
-            _enemyType = ResolveOne(EnemyTypeCandidates);
-            Plugin.Log?.LogInfo(
-                $"Resolved types: Item={_itemType?.FullName ?? "?"}, " +
-                $"Valuable={_valuableType?.FullName ?? "?"}, " +
-                $"Enemy={_enemyType?.FullName ?? "?"}");
-        }
+        public static bool AnyHookFailed => FailedHooks.Count > 0;
 
-        private static Type ResolveOne(string[] candidates)
+        public static void Install(Harmony harmony)
         {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            Hook("shop items", () =>
+                harmony.Patch(Find(typeof(ShopManager), "GetAllItemsFromStatsManager"),
+                    postfix: Mine(nameof(ShopPoolsPostfix))));
+
+            Hook("upgrade stand", () =>
             {
-                if (IsExternalAssembly(asm)) continue;
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray(); }
-                catch { continue; }
-                foreach (var name in candidates)
-                {
-                    var hit = types.FirstOrDefault(t => t != null && t.Name == name && typeof(UnityEngine.Object).IsAssignableFrom(t));
-                    if (hit != null) return hit;
-                }
-            }
-            return null;
+                _upgradeRoll = Find(typeof(UpgradeStand), "GetWeightedUpgradeExcluding");
+                harmony.Patch(_upgradeRoll, postfix: Mine(nameof(UpgradeRollPostfix)));
+            });
+
+            Hook("enemies", () =>
+            {
+                // The count fix goes in first: leaving a pick out without it would break level loading.
+                harmony.Patch(Find(typeof(EnemyDirector), "AmountSetup"),
+                    postfix: Mine(nameof(AmountSetupPostfix)));
+                harmony.Patch(Find(typeof(EnemyDirector), "PickEnemies"),
+                    prefix: Mine(nameof(PickEnemiesPrefix)),
+                    postfix: Mine(nameof(PickEnemiesPostfix)));
+            });
+
+            Hook("valuables", () =>
+                harmony.Patch(Find(typeof(ValuableDirector), "SetupHost"),
+                    postfix: Mine(nameof(SetupHostPostfix))));
         }
 
-        /// <summary>Enumerates every loaded asset of the given category's type.</summary>
-        public static IEnumerable<UnityEngine.Object> Discover(BlacklistCategory cat)
-        {
-            var t = TypeFor(cat);
-            if (t == null) return Array.Empty<UnityEngine.Object>();
-            return Resources.FindObjectsOfTypeAll(t).Where(o => o != null);
-        }
-
-        /// <summary>
-        /// Walks every reachable MonoBehaviour (including DDOL and inactive) plus all
-        /// static fields on game-assembly types, removing blacklisted entries from any
-        /// List, array, or Dictionary that holds Item/Valuable/Enemy assets.
-        /// </summary>
-        public static void Apply()
-        {
-            ApplyInternal(dump: false);
-        }
-
-        /// <summary>
-        /// Same as Apply but also logs every (owner, field, type, count) tuple visited.
-        /// Use when investigating a "still spawning" report.
-        /// </summary>
-        public static void Dump()
-        {
-            ApplyInternal(dump: true);
-        }
-
-        private static void ApplyInternal(bool dump)
+        private static void Hook(string name, Action install)
         {
             try
             {
-                Resolve();
-                if (Plugin.Store == null) return;
-                if (_itemType == null && _valuableType == null && _enemyType == null) return;
-
-                int filteredFields = 0;
-                int removedTotal = 0;
-                int visitedFields = 0;
-
-                // 1) Instance fields on every MonoBehaviour in the active scene + DDOL.
-                // FindObjectsOfType(true) includes inactive but excludes prefab assets,
-                // which is exactly what we want and roughly an order of magnitude
-                // cheaper than Resources.FindObjectsOfTypeAll.
-                var behaviours = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>(true);
-                foreach (var mb in behaviours)
-                {
-                    if (mb == null) continue;
-                    var t = mb.GetType();
-                    var matched = GetMatchedInstanceFields(t);
-                    if (matched.Length == 0) continue;
-                    foreach (var hit in matched)
-                    {
-                        var value = hit.Field.GetValue(mb);
-                        visitedFields++;
-                        if (value == null) continue;
-                        int beforeCount = ContainerCount(value, hit.Kind);
-                        int removed = StripBlacklisted(ref value, hit.Cat, hit.Elem, hit.Kind);
-                        if (removed > 0) { filteredFields++; removedTotal += removed; hit.Field.SetValue(mb, value); }
-                        if (dump)
-                            Plugin.Log?.LogInfo($"[dump] inst {t.FullName}.{hit.Field.Name} : {hit.Field.FieldType.Name} count={beforeCount} removed={removed} cat={hit.Cat}");
-                    }
-                }
-
-                // 2) Static fields on game-assembly types (cached).
-                if (_staticFieldCache == null) BuildStaticFieldCache();
-                foreach (var hit in _staticFieldCache)
-                {
-                    var value = hit.Field.GetValue(null);
-                    visitedFields++;
-                    if (value == null) continue;
-                    int beforeCount = ContainerCount(value, hit.Kind);
-                    int removed = StripBlacklisted(ref value, hit.Cat, hit.Elem, hit.Kind);
-                    if (removed > 0) { filteredFields++; removedTotal += removed; hit.Field.SetValue(null, value); }
-                    if (dump)
-                        Plugin.Log?.LogInfo($"[dump] static {hit.Field.DeclaringType?.FullName}.{hit.Field.Name} : {hit.Field.FieldType.Name} count={beforeCount} removed={removed} cat={hit.Cat}");
-                }
-
-                if (dump || removedTotal > 0)
-                    Plugin.Log?.LogInfo($"Filter pass: visited {visitedFields} field(s), filtered {removedTotal} entries across {filteredFields} field(s).");
+                install();
+                ActiveHooks.Add(name);
             }
             catch (Exception e)
             {
-                Plugin.Log?.LogError($"Apply failed: {e}");
+                FailedHooks.Add(name);
+                Plugin.Log.LogError($"The {name} blacklist cannot work with this game version: {e.Message}");
             }
         }
 
-        private static void BuildStaticFieldCache()
+        private static MethodInfo Find(Type type, string name)
         {
-            _staticFieldCache = new List<FieldHit>();
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            var method = type.GetMethod(name, AccessTools.all);
+            if (method == null) throw new MissingMethodException(type.Name + "." + name + " was not found");
+            return method;
+        }
+
+        private static HarmonyMethod Mine(string name)
+        {
+            return new HarmonyMethod(typeof(BlacklistFilter).GetMethod(name, AccessTools.all));
+        }
+
+        private static bool IsHost()
+        {
+            return SemiFunc.IsMasterClientOrSingleplayer();
+        }
+
+        private static bool Blocked(BlacklistCategory category, string name)
+        {
+            return Plugin.Store.IsBlacklisted(category, name);
+        }
+
+        private static void ReportOnce(string where, Exception e)
+        {
+            if (ReportedFailures.Add(where))
             {
-                if (IsExternalAssembly(asm)) continue;
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray(); }
-                catch { continue; }
-                foreach (var t in types)
+                Plugin.Log.LogError($"The {where} blacklist failed and was skipped: {e}");
+            }
+        }
+
+        // ---------------------------------------------------------------- shop items
+
+        private static void ShopPoolsPostfix(ShopManager __instance)
+        {
+            try
+            {
+                if (Plugin.Store.Count(BlacklistCategory.Item) == 0 || !IsHost()) return;
+
+                var leftOut = new HashSet<string>(StringComparer.Ordinal);
+                RemoveBlocked(__instance.potentialItems, leftOut);
+                RemoveBlocked(__instance.potentialItemConsumables, leftOut);
+                RemoveBlocked(__instance.potentialItemUpgrades, leftOut);
+                RemoveBlocked(__instance.potentialItemHealthPacks, leftOut);
+                if (__instance.potentialSecretItems != null)
                 {
-                    if (t == null) continue;
-                    FieldInfo[] fields;
-                    try { fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static); }
-                    catch { continue; }
-                    foreach (var f in fields)
+                    foreach (var pool in __instance.potentialSecretItems.Values) RemoveBlocked(pool, leftOut);
+                }
+
+                if (leftOut.Count > 0)
+                {
+                    Plugin.Log.LogInfo($"Shop: left out {leftOut.Count} blacklisted item(s): {string.Join(", ", leftOut.OrderBy(n => n))}.");
+                }
+            }
+            catch (Exception e)
+            {
+                ReportOnce("shop items", e);
+            }
+        }
+
+        private static void RemoveBlocked(List<Item> pool, HashSet<string> leftOut)
+        {
+            if (pool == null) return;
+            for (int i = pool.Count - 1; i >= 0; i--)
+            {
+                var item = pool[i];
+                if (item == null) continue;
+                string name = item.name;
+                if (Blocked(BlacklistCategory.Item, name))
+                {
+                    leftOut.Add(name);
+                    pool.RemoveAt(i);
+                }
+            }
+        }
+
+        // The upgrade stand rerolls from the full item list, not from the shop pools above.
+        private static void UpgradeRollPostfix(UpgradeStand __instance, ref Item __result, Item excludeItem,
+            Dictionary<string, int> displayedCounts, Dictionary<string, int> selectedDuringReroll)
+        {
+            if (_rerollingUpgrade || __result == null) return;
+            try
+            {
+                if (!Blocked(BlacklistCategory.Item, __result.name) || !IsHost()) return;
+
+                _rerollingUpgrade = true;
+                Item pick = null;
+                for (int attempt = 0; attempt < 12; attempt++)
+                {
+                    var candidate = (Item)_upgradeRoll.Invoke(__instance,
+                        new object[] { excludeItem, displayedCounts, selectedDuringReroll, false });
+                    if (candidate == null) break;
+                    if (!Blocked(BlacklistCategory.Item, candidate.name))
                     {
-                        var (cat, elem, kind) = MatchField(f.FieldType);
-                        if (cat == null) continue;
-                        _staticFieldCache.Add(new FieldHit { Field = f, Cat = cat.Value, Elem = elem, Kind = kind });
+                        pick = candidate;
+                        break;
                     }
                 }
+
+                // Null leaves that slot of the stand empty, which the game handles.
+                __result = pick;
             }
-            Plugin.Log?.LogInfo($"Static field cache: {_staticFieldCache.Count} hit(s).");
+            catch (Exception e)
+            {
+                ReportOnce("upgrade stand", e);
+            }
+            finally
+            {
+                _rerollingUpgrade = false;
+            }
         }
 
-        private static FieldHit[] GetMatchedInstanceFields(Type t)
-        {
-            if (_instanceFieldCache.TryGetValue(t, out var cached)) return cached;
-            // Filter out external types up front — saves walking their fields.
-            if (IsExternalAssembly(t.Assembly))
-            {
-                _instanceFieldCache[t] = _emptyHits;
-                return _emptyHits;
-            }
-            FieldInfo[] fields;
-            try { fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
-            catch { _instanceFieldCache[t] = _emptyHits; return _emptyHits; }
-            List<FieldHit> hits = null;
-            foreach (var f in fields)
-            {
-                var (cat, elem, kind) = MatchField(f.FieldType);
-                if (cat == null) continue;
-                (hits ?? (hits = new List<FieldHit>())).Add(new FieldHit { Field = f, Cat = cat.Value, Elem = elem, Kind = kind });
-            }
-            var arr = hits == null ? _emptyHits : hits.ToArray();
-            _instanceFieldCache[t] = arr;
-            return arr;
-        }
+        // ---------------------------------------------------------------- enemies
 
-        private enum ContainerKind { None, Array, List, Dictionary }
-
-        private static (BlacklistCategory? cat, Type elem, ContainerKind kind) MatchField(Type fieldType)
+        private static void PickEnemiesPrefix(ref List<EnemySetup> _enemiesList, out bool __state)
         {
-            if (fieldType.IsArray)
+            __state = false;
+            try
             {
-                var elem = fieldType.GetElementType();
-                var cat = ClassifyElement(elem);
-                return cat == null ? (null, null, ContainerKind.None) : (cat, elem, ContainerKind.Array);
-            }
-            if (fieldType.IsGenericType)
-            {
-                var def = fieldType.GetGenericTypeDefinition();
-                var args = fieldType.GetGenericArguments();
-                if (def == typeof(List<>))
+                if (_enemiesList == null || Plugin.Store.Count(BlacklistCategory.Enemy) == 0 || !IsHost()) return;
+
+                List<EnemySetup> allowed = null;
+                for (int i = 0; i < _enemiesList.Count; i++)
                 {
-                    var elem = args[0];
-                    var cat = ClassifyElement(elem);
-                    return cat == null ? (null, null, ContainerKind.None) : (cat, elem, ContainerKind.List);
+                    var enemy = _enemiesList[i];
+                    bool blocked = enemy != null && Blocked(BlacklistCategory.Enemy, enemy.name);
+                    if (blocked && allowed == null) allowed = _enemiesList.GetRange(0, i);
+                    else if (!blocked && allowed != null) allowed.Add(enemy);
                 }
-                if (def == typeof(Dictionary<,>))
+
+                if (allowed == null) return;
+
+                // The game picks from this copy; its own list keeps every enemy.
+                _enemiesList = allowed;
+                __state = true;
+                _enemyPicksFiltered++;
+            }
+            catch (Exception e)
+            {
+                ReportOnce("enemies", e);
+            }
+        }
+
+        private static void PickEnemiesPostfix(bool __state, List<EnemySetup> ___enemyListCurrent, List<EnemySetup> ___enemyList)
+        {
+            if (!__state) return;
+
+            // With nothing left to pick from, the game adds an empty slot, and an empty slot stops
+            // the level from loading. Take it back out; AmountSetupPostfix lowers the count to match.
+            DropEmptyLastSlot(___enemyListCurrent);
+            DropEmptyLastSlot(___enemyList);
+        }
+
+        private static void DropEmptyLastSlot(List<EnemySetup> list)
+        {
+            if (list != null && list.Count > 0 && list[list.Count - 1] == null)
+            {
+                list.RemoveAt(list.Count - 1);
+            }
+        }
+
+        private static void AmountSetupPostfix(ref int ___totalAmount, List<EnemySetup> ___enemyListCurrent)
+        {
+            int filtered = _enemyPicksFiltered;
+            _enemyPicksFiltered = 0;
+            if (filtered == 0 || ___enemyListCurrent == null) return;
+
+            int wanted = ___totalAmount;
+            if (___enemyListCurrent.Count < wanted) ___totalAmount = ___enemyListCurrent.Count;
+
+            string line = $"Enemies: blacklist used for {filtered} of {wanted} pick(s) in this level";
+            if (___totalAmount < wanted)
+            {
+                line += $"; {wanted - ___totalAmount} left empty because every enemy of that difficulty is blacklisted";
+            }
+            Plugin.Log.LogInfo(line + ".");
+        }
+
+        // ---------------------------------------------------------------- valuables
+
+        // SetupHost is a coroutine: its first step copies the level's valuable presets into the
+        // director's own lists. Blacklisted entries are taken out of the presets just for that
+        // step and put back straight after, so the presets end up exactly as the game made them.
+        private static void SetupHostPostfix(ref IEnumerator __result)
+        {
+            if (__result != null) __result = FilteredSetup(__result);
+        }
+
+        private static IEnumerator FilteredSetup(IEnumerator original)
+        {
+            var hidden = new List<KeyValuePair<List<PrefabRef>, PrefabRef[]>>();
+            bool more;
+            try
+            {
+                HideBlacklistedValuables(hidden);
+                more = original.MoveNext();
+            }
+            finally
+            {
+                foreach (var entry in hidden)
                 {
-                    // Match either key or value being a target type. For removal, we care
-                    // about both: build a dictionary entry only counts if EITHER the key
-                    // or the value is a UnityEngine.Object whose name is blacklisted.
-                    var keyCat = ClassifyElement(args[0]);
-                    var valCat = ClassifyElement(args[1]);
-                    if (keyCat != null) return (keyCat, args[0], ContainerKind.Dictionary);
-                    if (valCat != null) return (valCat, args[1], ContainerKind.Dictionary);
+                    entry.Key.Clear();
+                    entry.Key.AddRange(entry.Value);
                 }
             }
-            return (null, null, ContainerKind.None);
-        }
 
-        private static BlacklistCategory? ClassifyElement(Type elem)
-        {
-            if (elem == null) return null;
-            if (_itemType != null && _itemType.IsAssignableFrom(elem)) return BlacklistCategory.Item;
-            if (_valuableType != null && _valuableType.IsAssignableFrom(elem)) return BlacklistCategory.Valuable;
-            if (_enemyType != null && _enemyType.IsAssignableFrom(elem)) return BlacklistCategory.Enemy;
-            return null;
-        }
-
-        private static int ContainerCount(object value, ContainerKind kind)
-        {
-            if (value == null) return 0;
-            if (kind == ContainerKind.Dictionary && value is IDictionary d) return d.Count;
-            if (value is ICollection c) return c.Count;
-            return 0;
-        }
-
-        private static int StripBlacklisted(ref object value, BlacklistCategory cat, Type elem, ContainerKind kind)
-        {
-            if (value == null) return 0;
-            switch (kind)
+            while (more)
             {
-                case ContainerKind.Array:
+                yield return original.Current;
+                more = original.MoveNext();
+            }
+        }
+
+        private static void HideBlacklistedValuables(List<KeyValuePair<List<PrefabRef>, PrefabRef[]>> hidden)
+        {
+            try
+            {
+                if (Plugin.Store.Count(BlacklistCategory.Valuable) == 0 || !IsHost()) return;
+
+                var generator = LevelGenerator.Instance;
+                var level = generator != null ? generator.Level : null;
+                if (level == null || level.ValuablePresets == null) return;
+
+                var pools = new HashSet<List<PrefabRef>>();
+                foreach (var preset in level.ValuablePresets)
                 {
-                    var arr = (Array)value;
-                    var kept = new List<object>(arr.Length);
-                    int removed = 0;
-                    foreach (var item in arr)
+                    foreach (var pool in SizePools(preset)) pools.Add(pool);
+                }
+
+                int total = 0;
+                int blockedEntries = 0;
+                var leftOut = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var pool in pools)
+                {
+                    foreach (var valuable in pool)
                     {
-                        if (item is UnityEngine.Object uo && Plugin.Store.IsBlacklisted(cat, uo.name)) { removed++; continue; }
-                        kept.Add(item);
+                        total++;
+                        if (!IsBlocked(valuable)) continue;
+                        blockedEntries++;
+                        leftOut.Add(valuable.PrefabName);
                     }
-                    if (removed > 0)
-                    {
-                        var newArr = Array.CreateInstance(elem, kept.Count);
-                        for (int i = 0; i < kept.Count; i++) newArr.SetValue(kept[i], i);
-                        value = newArr;
-                    }
-                    return removed;
                 }
-                case ContainerKind.List:
+
+                if (blockedEntries == 0) return;
+
+                // With every valuable blacklisted the level gets none. The game copes: its spawn loop
+                // stops at once, the haul goal becomes $0 and the extraction point completes at $0.
+                foreach (var pool in pools)
                 {
-                    var list = (IList)value;
-                    int removed = 0;
-                    for (int i = list.Count - 1; i >= 0; i--)
-                    {
-                        if (list[i] is UnityEngine.Object uo && Plugin.Store.IsBlacklisted(cat, uo.name))
+                    if (!pool.Any(IsBlocked)) continue;
+                    hidden.Add(new KeyValuePair<List<PrefabRef>, PrefabRef[]>(pool, pool.ToArray()));
+                    pool.RemoveAll(IsBlocked);
+                }
+
+                if (blockedEntries >= total)
+                {
+                    Plugin.Log.LogInfo($"Valuables: all {leftOut.Count} valuable(s) of this level are blacklisted, so this level has none.");
+                }
+                else
+                {
+                    Plugin.Log.LogInfo($"Valuables: left out {leftOut.Count} blacklisted valuable(s) in this level: {string.Join(", ", leftOut.OrderBy(n => n))}.");
+                }
+            }
+            catch (Exception e)
+            {
+                ReportOnce("valuables", e);
+            }
+        }
+
+        private static bool IsBlocked(PrefabRef valuable)
+        {
+            return valuable != null && Blocked(BlacklistCategory.Valuable, valuable.PrefabName);
+        }
+
+        private static IEnumerable<List<PrefabRef>> SizePools(LevelValuables preset)
+        {
+            if (preset == null) yield break;
+            if (preset.tiny != null) yield return preset.tiny;
+            if (preset.small != null) yield return preset.small;
+            if (preset.medium != null) yield return preset.medium;
+            if (preset.big != null) yield return preset.big;
+            if (preset.wide != null) yield return preset.wide;
+            if (preset.tall != null) yield return preset.tall;
+            if (preset.veryTall != null) yield return preset.veryTall;
+        }
+
+        // ---------------------------------------------------------------- menu lists
+
+        /// <summary>Names the menu can offer for a tab, sorted. Empty until the game has loaded them.</summary>
+        public static List<string> Discover(BlacklistCategory category)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                switch (category)
+                {
+                    case BlacklistCategory.Item:
+                        if (StatsManager.instance != null && StatsManager.instance.itemDictionary != null)
                         {
-                            list.RemoveAt(i);
-                            removed++;
+                            foreach (var item in StatsManager.instance.itemDictionary.Values)
+                            {
+                                if (item != null) names.Add(item.name);
+                            }
                         }
-                    }
-                    return removed;
+                        break;
+
+                    case BlacklistCategory.Enemy:
+                        var director = EnemyDirector.instance;
+                        if (director != null)
+                        {
+                            AddEnemies(names, director.enemiesDifficulty1);
+                            AddEnemies(names, director.enemiesDifficulty2);
+                            AddEnemies(names, director.enemiesDifficulty3);
+                        }
+                        if (names.Count == 0) AddEnemies(names, Resources.FindObjectsOfTypeAll<EnemySetup>());
+                        break;
+
+                    case BlacklistCategory.Valuable:
+                        var presets = new HashSet<LevelValuables>(Resources.FindObjectsOfTypeAll<LevelValuables>());
+                        if (RunManager.instance != null && RunManager.instance.levels != null)
+                        {
+                            foreach (var level in RunManager.instance.levels)
+                            {
+                                if (level == null || level.ValuablePresets == null) continue;
+                                foreach (var preset in level.ValuablePresets) presets.Add(preset);
+                            }
+                        }
+                        foreach (var preset in presets)
+                        {
+                            foreach (var pool in SizePools(preset))
+                            {
+                                foreach (var valuable in pool)
+                                {
+                                    if (valuable != null) names.Add(valuable.PrefabName);
+                                }
+                            }
+                        }
+                        break;
                 }
-                case ContainerKind.Dictionary:
-                {
-                    var dict = (IDictionary)value;
-                    var keysToRemove = new List<object>();
-                    foreach (DictionaryEntry e in dict)
-                    {
-                        if (e.Key is UnityEngine.Object ko && Plugin.Store.IsBlacklisted(cat, ko.name)) { keysToRemove.Add(e.Key); continue; }
-                        if (e.Value is UnityEngine.Object vo && Plugin.Store.IsBlacklisted(cat, vo.name)) { keysToRemove.Add(e.Key); continue; }
-                        // Heuristic: keys are often strings matching the asset name.
-                        if (e.Key is string ks && Plugin.Store.IsBlacklisted(cat, ks)) { keysToRemove.Add(e.Key); }
-                    }
-                    foreach (var k in keysToRemove) dict.Remove(k);
-                    return keysToRemove.Count;
-                }
-                default:
-                    return 0;
+            }
+            catch (Exception e)
+            {
+                ReportOnce(category + " list", e);
+            }
+
+            names.Remove(null);
+            names.Remove("");
+            var sorted = names.ToList();
+            sorted.Sort(StringComparer.OrdinalIgnoreCase);
+            return sorted;
+        }
+
+        private static void AddEnemies(HashSet<string> names, IEnumerable<EnemySetup> enemies)
+        {
+            if (enemies == null) return;
+            foreach (var enemy in enemies)
+            {
+                if (enemy != null) names.Add(enemy.name);
             }
         }
 
-        private static bool IsExternalAssembly(Assembly asm)
+        /// <summary>Writes what the mod sees to the log, for a "this still spawns" report.</summary>
+        public static void Dump()
         {
-            var name = asm.GetName().Name;
-            if (string.IsNullOrEmpty(name)) return true;
-            if (name == "REPOBlacklist") return true;
-            if (name.StartsWith("UnityEngine") || name.StartsWith("Unity.")) return true;
-            if (name.StartsWith("System") || name == "mscorlib" || name == "netstandard") return true;
-            if (name.StartsWith("BepInEx") || name == "0Harmony" || name.StartsWith("HarmonyX") || name == "Mono.Cecil") return true;
-            if (name.StartsWith("Microsoft.")) return true;
-            return false;
+            var log = Plugin.Log;
+            log.LogInfo("[dump] " + Plugin.NAME + " " + Plugin.VERSION + ", hooks: " + HookSummary);
+            try
+            {
+                log.LogInfo("[dump] Host or singleplayer: " + IsHost());
+            }
+            catch (Exception)
+            {
+                log.LogInfo("[dump] Host or singleplayer: unknown (no game running)");
+            }
+
+            foreach (BlacklistCategory category in Enum.GetValues(typeof(BlacklistCategory)))
+            {
+                var found = Discover(category);
+                var listed = Plugin.Store.Snapshot(category).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+                log.LogInfo($"[dump] {category}: {listed.Count} blacklisted: {string.Join(", ", listed)}");
+                log.LogInfo($"[dump] {category}: {found.Count} found in the game: {string.Join(", ", found)}");
+            }
         }
     }
 }

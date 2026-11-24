@@ -1,12 +1,9 @@
-using System;
 using System.IO;
-using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace REPOBlacklist
 {
@@ -15,7 +12,10 @@ namespace REPOBlacklist
     {
         public const string GUID = "isaia.repoblacklist";
         public const string NAME = "REPOBlacklist";
-        public const string VERSION = "0.2.2";
+        // Written by the build from version_number in manifest.json (see REPOBlacklist.csproj).
+        public const string VERSION = PluginVersion.Value;
+
+        private const string StoreFileName = "REPOBlacklist.json";
 
         public static Plugin Instance { get; private set; }
         public static ManualLogSource Log { get; private set; }
@@ -24,7 +24,6 @@ namespace REPOBlacklist
         public ConfigEntry<KeyCode> MenuToggleKey;
 
         private Harmony _harmony;
-        private BlacklistUI _ui;
 
         private void Awake()
         {
@@ -35,44 +34,19 @@ namespace REPOBlacklist
                 "UI", "MenuToggleKey", KeyCode.F3,
                 "Key that opens/closes the in-game blacklist menu.");
 
-            var storePath = Path.Combine(Paths.ConfigPath, "REPOBlacklist.json");
-            Store = new BlacklistStore(storePath);
-            Store.Changed += OnBlacklistChanged;
+            Store = new BlacklistStore(Path.Combine(Paths.ConfigPath, StoreFileName), Log);
 
             _harmony = new Harmony(GUID);
-            try { _harmony.PatchAll(Assembly.GetExecutingAssembly()); }
-            catch (Exception e) { Log.LogWarning($"Harmony patch issues (non-fatal): {e.Message}"); }
-            InputBlocker.PatchInputSystem(_harmony);
+            BlacklistFilter.Install(_harmony);
 
-            _ui = gameObject.AddComponent<BlacklistUI>();
+            gameObject.AddComponent<BlacklistUI>();
 
-            SceneManager.sceneLoaded += OnSceneLoaded;
-
-            Log.LogInfo($"{NAME} {VERSION} loaded. Blacklist: {storePath}");
+            Log.LogInfo($"{NAME} {VERSION} loaded. Menu: {MenuToggleKey.Value}. {Store.Total} blacklisted in {StoreFileName}. Working: {BlacklistFilter.HookSummary}.");
         }
 
         private void OnDestroy()
         {
-            SceneManager.sceneLoaded -= OnSceneLoaded;
             _harmony?.UnpatchSelf();
-            if (Store != null) Store.Changed -= OnBlacklistChanged;
-        }
-
-        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
-        {
-            // Defer one frame so directors finish their own Awake before we filter.
-            StartCoroutine(ApplyNextFrame());
-        }
-
-        private System.Collections.IEnumerator ApplyNextFrame()
-        {
-            yield return null;
-            BlacklistFilter.Apply();
-        }
-
-        private void OnBlacklistChanged()
-        {
-            BlacklistFilter.Apply();
         }
     }
 }

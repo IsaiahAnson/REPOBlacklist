@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using BepInEx.Logging;
 using UnityEngine;
 
 namespace REPOBlacklist
@@ -8,10 +9,9 @@ namespace REPOBlacklist
     public enum BlacklistCategory { Item, Valuable, Enemy }
 
     /// <summary>
-    /// Persistent store backed by a single JSON file. Keys are asset names (the Unity
-    /// Object.name of the underlying ScriptableObject), grouped by category.
-    /// Mutations write through to disk immediately so the in-game UI and the runtime
-    /// filter never disagree.
+    /// The blacklist, kept in one JSON file (BepInEx/config/REPOBlacklist.json). Entries are asset
+    /// names grouped by category: the Item and EnemySetup asset names and the valuable prefab
+    /// names. Every change is written to disk straight away.
     /// </summary>
     public class BlacklistStore
     {
@@ -24,39 +24,48 @@ namespace REPOBlacklist
         }
 
         private readonly string _path;
+        private readonly ManualLogSource _log;
         private readonly HashSet<string> _items = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _valuables = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _enemies = new HashSet<string>(StringComparer.Ordinal);
 
-        public event Action Changed;
-
-        public BlacklistStore(string path)
+        public BlacklistStore(string path, ManualLogSource log)
         {
             _path = path;
+            _log = log;
             Load();
         }
 
         public bool IsBlacklisted(BlacklistCategory cat, string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            return Set(cat).Contains(name);
+            return Names(cat).Contains(name);
         }
 
-        public IReadOnlyCollection<string> Snapshot(BlacklistCategory cat) => Set(cat);
+        public int Count(BlacklistCategory cat) => Names(cat).Count;
+
+        public int Total => _items.Count + _valuables.Count + _enemies.Count;
+
+        public IReadOnlyCollection<string> Snapshot(BlacklistCategory cat) => Names(cat);
 
         public void Set(BlacklistCategory cat, string name, bool blacklisted)
         {
             if (string.IsNullOrEmpty(name)) return;
-            var set = Set(cat);
-            bool changed = blacklisted ? set.Add(name) : set.Remove(name);
-            if (changed)
-            {
-                Save();
-                Changed?.Invoke();
-            }
+            var names = Names(cat);
+            bool changed = blacklisted ? names.Add(name) : names.Remove(name);
+            if (changed) Save();
         }
 
-        private HashSet<string> Set(BlacklistCategory cat)
+        /// <summary>Empties one category and writes the file once.</summary>
+        public void Clear(BlacklistCategory cat)
+        {
+            var names = Names(cat);
+            if (names.Count == 0) return;
+            names.Clear();
+            Save();
+        }
+
+        private HashSet<string> Names(BlacklistCategory cat)
         {
             switch (cat)
             {
@@ -69,18 +78,46 @@ namespace REPOBlacklist
 
         private void Load()
         {
+            if (!File.Exists(_path)) return;
             try
             {
-                if (!File.Exists(_path)) return;
-                var json = File.ReadAllText(_path);
-                var dto = JsonUtility.FromJson<Dto>(json) ?? new Dto();
-                _items.Clear(); foreach (var n in dto.items ?? new List<string>()) _items.Add(n);
-                _valuables.Clear(); foreach (var n in dto.valuables ?? new List<string>()) _valuables.Add(n);
-                _enemies.Clear(); foreach (var n in dto.enemies ?? new List<string>()) _enemies.Add(n);
+                string json = File.ReadAllText(_path);
+                if (string.IsNullOrWhiteSpace(json)) return;
+
+                var dto = JsonUtility.FromJson<Dto>(json);
+                if (dto == null) throw new FormatException("no blacklist found in the file");
+                Fill(_items, dto.items);
+                Fill(_valuables, dto.valuables);
+                Fill(_enemies, dto.enemies);
             }
             catch (Exception e)
             {
-                Debug.LogError($"[REPOBlacklist] Failed to load {_path}: {e}");
+                // Keep a copy: the next change in the menu writes a fresh file over this one.
+                string file = Path.GetFileName(_path);
+                string kept = "";
+                try
+                {
+                    File.Copy(_path, _path + ".bak", true);
+                    kept = $" A copy was kept as {file}.bak.";
+                }
+                catch (Exception)
+                {
+                    // Nothing more to do; the error below still says what happened.
+                }
+                _items.Clear();
+                _valuables.Clear();
+                _enemies.Clear();
+                _log.LogError($"Could not read {file}, so the blacklist starts empty.{kept} ({e.Message})");
+            }
+        }
+
+        private static void Fill(HashSet<string> target, List<string> names)
+        {
+            target.Clear();
+            if (names == null) return;
+            foreach (var name in names)
+            {
+                if (!string.IsNullOrEmpty(name)) target.Add(name);
             }
         }
 
@@ -98,11 +135,30 @@ namespace REPOBlacklist
                 dto.items.Sort(StringComparer.Ordinal);
                 dto.valuables.Sort(StringComparer.Ordinal);
                 dto.enemies.Sort(StringComparer.Ordinal);
-                File.WriteAllText(_path, JsonUtility.ToJson(dto, prettyPrint: true));
+
+                // Write a new file first and swap it in, so a crash mid-write cannot leave half a list.
+                string temp = _path + ".tmp";
+                File.WriteAllText(temp, JsonUtility.ToJson(dto, prettyPrint: true));
+                if (File.Exists(_path))
+                {
+                    try
+                    {
+                        File.Replace(temp, _path, null);
+                    }
+                    catch (Exception)
+                    {
+                        File.Copy(temp, _path, true);
+                        File.Delete(temp);
+                    }
+                }
+                else
+                {
+                    File.Move(temp, _path);
+                }
             }
             catch (Exception e)
             {
-                Debug.LogError($"[REPOBlacklist] Failed to save {_path}: {e}");
+                _log.LogError($"Could not save {Path.GetFileName(_path)}: {e.Message}");
             }
         }
     }
